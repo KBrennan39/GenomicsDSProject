@@ -1,0 +1,329 @@
+---
+title: "Maternal Microbiome"
+output: html_notebook
+---
+
+Introduction:
+
+Our dataset contains levels of gut bacteria in healthy and unhealthy pregnant women. In this project, we are trying to find "candidate" bacteria -> bacteria that likely contributes to the health of the sample, so we can zero in on what might be causing illness.
+
+Reading & Cleaning Data:
+
+- This data contains 7 healthy and 7 unhealthy samples from maternal microbiomes
+
+- To clean the data, we will remove the column containing averages for each bacteria and merge the first three columns into row names that contain the names for each bacteria
+```{r}
+my_data<- read.csv("./maternalmicrobiome.csv", header=TRUE)
+my_data<- my_data[,1:17]
+head(my_data)
+```
+```{r}
+sub_data<- my_data[, 1:3]
+row_names<-apply(sub_data, 1, function(r){paste(r[1], r[2], r[3], sep="_")})
+row.names(my_data)<- row_names
+my_data<- my_data[,-c(1, 2, 3)]
+head(my_data)
+```
+
+
+Reformatting Data
+```{r}
+transposed_data<- data.frame(t(my_data))
+head(transposed_data)
+```
+Finding candidates out of bacteria:
+
+- We will use two sample t-tests to identify which bacteria are potential candidates, by looking at the bacteria with the most obvious difference in healthy and unhealthy samples
+
+- The p-value is the probability that the differences in bacteria levels in these two groups are due to sampling errors
+
+- The lower the p-value, the more likely the bacteria is a candidate
+```{r}
+candidates<- c()
+significance_level<- 0.05
+valid_p_values<- c()
+for(i in 1:ncol(transposed_data)){
+  healthy<-sapply(transposed_data[1:7, i], as.numeric)
+  unhealthy<-sapply(transposed_data[8:14, i], as.numeric)
+  results<- stats::t.test(healthy, unhealthy)
+  if(results$p.value<=significance_level){
+    candidates<- c(candidates, colnames(transposed_data)[i])
+    valid_p_values<- c(valid_p_values, results$p.value)
+  }
+}
+candidates
+valid_p_values
+```
+With Bonferoni Correction:
+```{r}
+candidates_bon<- c()
+significance_level_bon<- 0.05
+valid_p_values_bon<- c()
+for(i in 1:ncol(transposed_data)){
+  healthy<-sapply(transposed_data[1:7, i], as.numeric)
+  unhealthy<-sapply(transposed_data[8:14, i], as.numeric)
+  results<- stats::t.test(healthy, unhealthy)
+  significance_level_bon<-significance_level_bon/i
+  if(results$p.value<=significance_level_bon){
+    candidates_bon<- c(candidates_bon, colnames(transposed_data)[i])
+    valid_p_values_bon<- c(valid_p_values_bon, results$p.value)
+  }
+}
+candidates_bon
+valid_p_values_bon
+```
+
+FDR Correction:
+```{r}
+significance_level<- 0.2
+fdr_bacteria<-c()
+fdr_p_vals<- c()
+for(i in 1:ncol(transposed_data)){
+  healthy<-sapply(transposed_data[1:7, i], as.numeric)
+  unhealthy<-sapply(transposed_data[8:14, i], as.numeric)
+  results<- stats::t.test(healthy, unhealthy)
+  fdr_bacteria<- c(fdr_bacteria, colnames(transposed_data)[i])
+  fdr_p_vals<- c(fdr_p_vals, results$p.value)
+}
+m<- data.frame(fdr_bacteria, fdr_p_vals, p.adjust(fdr_p_vals, "fdr"), p.adjust(fdr_p_vals, "bonferroni"))
+names(m) <- c("bacteria_name", "p_values", "fdr_corrected_p_values", "bonferroni_corrected_p_values")
+
+m[m[fdr_corrected_p_values]<0.05, ]
+```
+Summary:
+
+- There are 3 bacteria with unadjusted p values less than are significance level of 0.05
+
+- After adjusting the p values using bonferroni correction and fdr correction, there are no bacteria that still have adjusted p values under the significance level
+
+- Our correction methods are too aggressive for our data
+
+Assembling Data:
+
+- The dataframe "m" contains the unadjusted p value, fdr corrected p value, and bonferroni corrected p value for each bacteria
+```{r}
+attach(m)
+m<- m[order(p_values),]
+m[1:30,]
+```
+Graphing Data
+
+```{r}
+plot_bacteria <- function(bacteria){
+  boxplot(transposed_data[1:7, bacteria], transposed_data[8:14, bacteria], main=paste(bacteria), col=c("green", "red"), names=c("healthy", "unhealthy"), cex.main=0.7)
+}
+par(mfrow=c(2, 2))
+plot_bacteria(m[1,1])
+plot_bacteria(m[2,1])
+plot_bacteria(m[3,1])
+plot_bacteria(m[4,1])
+
+```
+```{r}
+pdf("Test.pdf")
+par(mfrow=c(4, 2))
+top_7 <- m[1:7, 1]
+for (i in 1:7){
+  plot_bacteria(top_7[i])
+}
+graphics.off()
+```
+```{r}
+barplot(sapply(m[, 2:4], mean), main="Average P Values", names.arg = c("Unadjusted", "FDR Corrected", "Bonferroni Corrected"), col=c("white", "grey", "black"))
+```
+Making an XGBoost Model:
+
+- None of the bacteria had significant p-values, so our next step is using XGBoost to identify candidate bacteria
+
+- xgboost stands for extreme gradient boosting, which is an ensemble learner that uses gradient boosting
+
+- the gradient minimizes the loss from each model, and boosting is used to allow models to learn from the mistakes of previous models
+
+- We'll use xgboost to make a model that receives a sample and predicts whether it is healthy or unhealthy based on its bacteria levels
+
+- The important features of the model will reveal which bacteria are the strongest indicators of whether or not the sample is healthy
+
+- Max.depth = 4
+
+- eta = 1
+
+- nrounds = 3
+
+- objective = "binary:logistic"
+
+https://www.r-bloggers.com/2018/05/tuning-xgboost-in-r-part-i/
+https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+
+```{r}
+labels<- c(1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+my_data<- transposed_data
+mod <- xgboost(data=as.matrix(my_data), label=labels, max.depth=4, eta=1, nrounds=3,  objective = "binary:logistic")
+
+```
+Now we can look at which features (bacteria) our model is labelling as important
+```{r}
+importance<- xgb.importance(model = mod)
+print(importance)
+xgb.plot.importance(importance_matrix = importance, col="black", cex=0.4)
+
+```
+- The model has found that these four bacteria are the best indicators of health, even though these bacteria don't have the lowest p values
+```{r}
+pdf("SignificantBacteria.pdf")
+par(mfrow=c(5, 2))
+top_7 <- m[1:7, 1]
+for (i in 1:7){
+  plot_bacteria(top_7[i])
+}
+plot_bacteria(importance[1, Feature])
+#plot_bacteria(importance[2, Feature])
+plot_bacteria(importance[3, Feature])
+plot_bacteria(importance[4, Feature])
+graphics.off()
+
+```
+
+We can use clustering to determine whether or not the important features found by our model are able to separate healthy from unhealthy samples
+
+We will use K Means clustering and hierarichical clustering.
+
+When using K means clustering, we are able to specify that we want the variables to separate our data into 2 clusters, which in our case is healthy and unhealthy
+```{r}
+xgb_bacteria <- as.matrix(transposed_data[, importance[,Feature]])
+#xgb_bacteria<- t(xgb_bacteria)
+```
+```{r}
+fit<- kmeans(xgb_bacteria, 2)
+fit$cluster
+```
+From the labels above, we can see that the kmeans clustering algorithm formed one cluster made up of 2 unhealthy samples,  and another cluster made up of the rest.
+
+This indicates that the features our model labelled at important do not perform strongly in distinguishing healthy from unhealthy samples.
+
+When using hierarchical clustering, the function determines how many clusters it should form
+```{r}
+d <- dist(xgb_bacteria, method = "euclidean") # distance matrix
+fit <- hclust(d, method="ward.D")
+plot(fit) # display dendogram
+groups <- cutree(fit, k=2)
+rect.hclust(fit, k=2, border="red")
+```
+- The graph above shows that even without our input, the function identified two clusters with the same split of samples.
+
+- We are also able to see the minor distinctions the algorithm is making between healthy and unhealthy
+
+- You can see that at a certain branch, a group of 4 unhealthy samples are separated by a group of 4 healthy samples
+
+Clustering with low p value bacteria:
+
+- I am interested to see if the 3 bacteria with the lowest p values from above will do a better job at clustering
+```{r}
+#head(transposed_data)
+t_bacteria <- as.matrix(transposed_data[,m[1:3, 1]])
+d <- dist(t_bacteria, method = "euclidean") # distance matrix
+fit2 <- hclust(d, method="ward.D")
+plot(fit2) # display dendogram
+groups <- cutree(fit2, k=2)
+rect.hclust(fit2, k=2, border="red")
+```
+- The bacteria with low p values were able to separate our data into a group of 4 unhealthy samples and another group containing the rest of the samples
+
+
+
+Conclusion:
+
+Due to our relatively small sample size, we were unable to find bacteria that are powerful indicators of whether or not a patient is healthy. However, we have identified bacteria of interest through t tests and xgboost, which could be interesting to research. The main bacteria of interest are:
+
+- "Streptococcaceae.g_Streptococcus.s_anginosus" (low p value)
+
+- "Lachnospiraceae.g_Blautia.s_wexlerae" (low p value)
+
+- "Lachnospiraceae.g_Dorea.s_formicigenerans" (low p value and important feature)
+
+- "Bacteroidaceae.g_Bacteroides.s_massiliensis"	(important feature)
+
+From clustering, we found that the variables with low p values are better at distinguishing healthy from unhealthy samples, so the first 3 bacteria above are likely more significant
+
+
+
+```{r}
+test_data<- read.csv("./zymo_test_set.csv")
+test_data<- test_data[-1,-c(1, 2, 3, 4, 5)]
+dim(test_data)
+```
+```{r}
+row_names<-apply(test_data, 1, function(r){paste(r[1], r[2], r[3], sep="_")})
+rownames(test_data) <- row_names
+test_data<- test_data[,-c(1, 2, 3)]
+head(test_data)
+```
+
+```{r}
+library(stringr)
+s <- c("hello;world", "by;.world")
+s<- sapply(s, function(e){as.character(str_replace(e, ";", "."))})
+#str_replace("hello;world",";", ".")
+s <- as.character(s)
+s
+```
+```{r}
+
+row_names<- as.character(row_names)
+
+#transposed_data[, "Methanobacteriaceae;g_Methanobrevibacter;s_smithii"]
+#test_data[      "Lachnospiraceae.g_Dorea.s_formicigenerans",]
+which(row_names=="Lachnospiraceae;g_Dorea;s_formicigenerans")
+
+test_data[201, ]
+```
+```{r}
+row_names <- as.character(sapply(row_names, function(e){str_replace(e, ";", ".")}))
+rownames(test_data)<- row_names
+head(test_data)
+```
+```{r}
+i <- intersect(row_names, colnames(transposed_data))
+length(i)
+```
+```{r}
+l_names<- c()
+for(i in 1:length(row_names)){
+  if (startsWith(row_names[i], "L")){
+    l_names<- c(l_names, row_names[i])
+  }
+}
+colnames(transposed_data)
+```
+```{r}
+transposed_test<- data.frame(t(test_data))
+full_data<- bind_rows(transposed_data, transposed_test)
+full_data
+```
+```{r}
+pos<- c(which(colnames(full_data)=="Lachnospiraceae.g_Dorea.s_formicigenerans"), which(colnames(full_data)=="Streptococcaceae.g_Streptococcus.s_anginosus"), which(colnames(full_data)=="Lachnospiraceae.g_Blautia.s_wexlerae"), which(colnames(full_data)=="Bacteroidaceae.g_Bacteroides.s_massiliensis"))
+significant_rows <- full_data[, pos]
+significant_rows
+```
+```{r}
+healthy_train<- significant_rows[1:7,]
+unhealthy_train<- significant_rows[8:14,]
+healthy_test<- significant_rows[15:23,]
+unhealthy_test<- significant_rows[23,]
+```
+
+
+```{r}
+plot_train_and_test <- function(i){
+  boxplot(healthy_train[,i], unhealthy_train[,i], healthy_test[,i], unhealthy_test[,i], names=c("Healthy\nTrain", "Unhealthy\nTrain", "Healthy\nTest", "Unhealthy\nTest"), main=colnames(significant_rows)[i])
+}
+#par(mfrow=c(2, 2))
+plot_train_and_test(1)
+plot_train_and_test(2)
+plot_train_and_test(3)
+plot_train_and_test(4)
+
+```
+
+```
+
+
